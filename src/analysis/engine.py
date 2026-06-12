@@ -41,9 +41,14 @@ class AnalysisEngine:
     配合多源交叉验证 (CorrelationEngine) 增强置信度。
     """
 
-    def __init__(self, config: Config, router: Optional[LLMRouter] = None):
+    def __init__(
+        self,
+        config: Config,
+        router: Optional[LLMRouter] = None,
+        provider: Optional[str] = None,
+    ):
         self.config = config
-        self.router = router or LLMRouter(config)
+        self.router = router or LLMRouter(config, provider=provider)
         self.correlation = CorrelationEngine()
 
     async def analyze(self, ctx: ResolvedCrashContext) -> AnalysisReport:
