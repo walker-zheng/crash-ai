@@ -6,3 +6,4 @@ data/*
 !data/.gitkeep
 dist/
 *.egg-info/
+.worktrees/
