@@ -1,5 +1,6 @@
 """Claude API 适配器 (Anthropic SDK)。"""
 import json
+import re
 import anthropic
 from src.analysis.providers.base import LLMProvider
 
@@ -34,7 +35,6 @@ class AnthropicProvider(LLMProvider):
         result = json.loads(text)
 
         # Normalize DeepSeek's flat CoT output into expected nested structure
-        # Only trigger when response has CoT step keys but NOT the expected root_cause
         cot_keys = {"signal_analysis", "root_cause_inference", "evidence_extraction"}
         if "root_cause" not in result and cot_keys & set(result.keys()):
             result = self._normalize_response(result)
@@ -53,38 +53,70 @@ class AnthropicProvider(LLMProvider):
         """
         normalized = {}
 
-        # Map root_cause
+        # Map root_cause — handle both flat strings and nested dicts
         rc = {}
-        if "root_cause_inference" in data:
-            rc["description"] = str(data["root_cause_inference"])
-        elif "signal_analysis" in data:
-            rc["description"] = str(data["signal_analysis"])
+        rci = data.get("root_cause_inference", {})
+        sig = data.get("signal_analysis", {})
 
-        # Infer category from description or crash context
-        desc_lower = rc.get("description", "").lower()
-        if "null" in desc_lower or "null pointer" in desc_lower:
-            rc["category"] = "null-deref"
-        elif "double free" in desc_lower:
-            rc["category"] = "double-free"
-        elif "buffer overflow" in desc_lower or "stack overflow" in desc_lower:
-            rc["category"] = "buffer-overflow"
-        elif "use after free" in desc_lower or "uaf" in desc_lower:
-            rc["category"] = "use-after-free"
-        elif "race" in desc_lower:
-            rc["category"] = "race-condition"
-        elif "deadlock" in desc_lower:
-            rc["category"] = "deadlock"
-        elif "unaligned" in desc_lower:
-            rc["category"] = "sigbus-unaligned"
-        elif "divide" in desc_lower or "division" in desc_lower:
-            rc["category"] = "division-by-zero"
-        elif "assert" in desc_lower:
-            rc["category"] = "assert-fail"
+        # Extract description
+        if isinstance(rci, dict):
+            rc["description"] = rci.get("trigger", str(rci))
+        elif isinstance(rci, str):
+            rc["description"] = rci
+        elif isinstance(sig, dict):
+            rc["description"] = sig.get("typical_cause", sig.get("meaning", str(sig)))
+        elif isinstance(sig, str):
+            rc["description"] = sig
+
+        # Extract category (prefer explicit category from LLM)
+        if isinstance(rci, dict) and "category" in rci:
+            raw_cat = rci["category"].lower()
+            if "null" in raw_cat:
+                rc["category"] = "null-deref"
+            elif "double free" in raw_cat:
+                rc["category"] = "double-free"
+            elif "buffer" in raw_cat or "overflow" in raw_cat:
+                rc["category"] = "buffer-overflow"
+            elif "use after free" in raw_cat or "uaf" in raw_cat:
+                rc["category"] = "use-after-free"
+            elif "race" in raw_cat:
+                rc["category"] = "race-condition"
+            elif "deadlock" in raw_cat:
+                rc["category"] = "deadlock"
+            elif "unaligned" in raw_cat:
+                rc["category"] = "sigbus-unaligned"
+            elif "divide" in raw_cat or "division" in raw_cat:
+                rc["category"] = "division-by-zero"
+            elif "assert" in raw_cat:
+                rc["category"] = "assert-fail"
+            else:
+                rc["category"] = raw_cat.replace(" ", "-")[:40]
         else:
-            rc["category"] = "unknown"
+            # Infer from description text
+            desc_lower = rc.get("description", "").lower()
+            if "null" in desc_lower:
+                rc["category"] = "null-deref"
+            elif "double free" in desc_lower:
+                rc["category"] = "double-free"
+            elif "buffer overflow" in desc_lower or "stack overflow" in desc_lower:
+                rc["category"] = "buffer-overflow"
+            elif "use after free" in desc_lower or "uaf" in desc_lower:
+                rc["category"] = "use-after-free"
+            elif "race" in desc_lower:
+                rc["category"] = "race-condition"
+            elif "deadlock" in desc_lower:
+                rc["category"] = "deadlock"
+            elif "unaligned" in desc_lower:
+                rc["category"] = "sigbus-unaligned"
+            elif "divide" in desc_lower:
+                rc["category"] = "division-by-zero"
+            elif "assert" in desc_lower:
+                rc["category"] = "assert-fail"
+            else:
+                rc["category"] = "unknown"
 
-        rc["crash_location"] = data.get("stack_analysis", "") if isinstance(data.get("stack_analysis"), str) else ""
-        rc["trigger_condition"] = ""
+        rc["crash_location"] = _extract_crash_location(data)
+        rc["trigger_condition"] = _extract_trigger_condition(data)
         normalized["root_cause"] = rc
 
         # Map evidence
@@ -95,7 +127,7 @@ class AnthropicProvider(LLMProvider):
                 if isinstance(e, str) else e
                 for e in evidence
             ]
-        else:
+        elif evidence:
             normalized["evidence"] = [
                 {"type": "logic", "description": str(evidence), "relevance": "MEDIUM"}
             ]
@@ -106,8 +138,8 @@ class AnthropicProvider(LLMProvider):
             normalized["fix_suggestion"] = fix
         elif isinstance(fix, list):
             normalized["fix_suggestion"] = "\n".join(str(f) for f in fix)
-        else:
-            normalized["fix_suggestion"] = str(fix) if fix else ""
+        elif fix:
+            normalized["fix_suggestion"] = str(fix)
 
         # Map confidence
         normalized["confidence"] = float(data.get("confidence", 0.5))
@@ -126,7 +158,6 @@ class AnthropicProvider(LLMProvider):
         for block in content:
             if hasattr(block, 'text'):
                 return block.text
-        # Fallback: try first block
         return str(content[0]) if content else ""
 
     @staticmethod
@@ -140,3 +171,38 @@ class AnthropicProvider(LLMProvider):
             else:
                 text = "\n".join(lines[1:])
         return text
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers for response normalization
+# ---------------------------------------------------------------------------
+
+def _extract_crash_location(data: dict) -> str:
+    """Extract crash location from CoT analysis fields."""
+    stack = data.get("stack_analysis", "")
+    # Handle nested dict format: {"frames": [{...}], "crash_path": "..."}
+    if isinstance(stack, dict):
+        frames = stack.get("frames", [])
+        if frames and isinstance(frames[0], dict):
+            f = frames[0]
+            func = f.get("function", "")
+            addr = f.get("address", "")
+            mod = f.get("module", "")
+            return f"{func} ({mod} @ {addr})"
+        return stack.get("crash_path", "")[:120]
+    if isinstance(stack, str) and stack:
+        m = re.search(r'(\w+\.\w+):(\d+)', stack)
+        if m:
+            return f"{m.group(1)}:{m.group(2)}"
+        return stack.split("\n")[0][:120]
+    return ""
+
+
+def _extract_trigger_condition(data: dict) -> str:
+    """Extract trigger condition from CoT analysis fields."""
+    reg = data.get("register_analysis", "")
+    if isinstance(reg, str) and reg:
+        if "null" in reg.lower() or "0x0" in reg:
+            return "Dereference of NULL or invalid pointer"
+        return reg[:200]
+    return ""
