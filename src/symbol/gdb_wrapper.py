@@ -1,9 +1,11 @@
 """GDB 非交互模式包装器 — DebuggerProtocol 实现。"""
+import shutil
 import subprocess
 from typing import Dict, List
 
 from src.symbol.protocol import DebuggerProtocol, ResolvedResult
 from src.symbol.gdb_parser import GDBOutputParser
+from src.errors import ConfigError
 
 
 class GDBWrapper(DebuggerProtocol):
@@ -18,6 +20,11 @@ class GDBWrapper(DebuggerProtocol):
     def __init__(self, gdb_path: str = "gdb"):
         self.gdb_path = gdb_path
         self.parser = GDBOutputParser()
+        if shutil.which(self.gdb_path) is None:
+            raise ConfigError(
+                f"GDB not found at '{self.gdb_path}'. "
+                f"Install gdb (apt: 'sudo apt install gdb', brew: 'brew install gdb')"
+            )
 
     def resolve_stack(
         self, core_path: str, symbol_paths: list[str]

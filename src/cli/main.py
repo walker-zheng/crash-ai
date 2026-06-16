@@ -134,6 +134,9 @@ def analyze(core_dump, source, symbols, output, fmt, provider, platform, no_ai, 
     except AnalysisIncompleteError as e:
         click.echo(f"分析不完整: {e}", err=True)
         sys.exit(EXIT_INCOMPLETE)
+    except FileNotFoundError as e:
+        click.echo(f"GDB 未安装: {e}", err=True)
+        sys.exit(EXIT_CONFIG_ERROR)
     except CrashAIError as e:
         click.echo(f"内部错误: {e}", err=True)
         sys.exit(EXIT_INTERNAL_ERROR)

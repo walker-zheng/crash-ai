@@ -25,21 +25,24 @@ class TestSymbolResolver:
         """验证默认使用 GDBWrapper"""
         from src.symbol.resolver import SymbolResolver
         from src.symbol.gdb_wrapper import GDBWrapper
-        resolver = SymbolResolver()
+        with patch('src.symbol.gdb_wrapper.shutil.which', return_value="/usr/bin/gdb"):
+            resolver = SymbolResolver()
         assert isinstance(resolver.debugger, GDBWrapper)
 
     def test_accepts_custom_debugger(self):
         """验证接受自定义 debugger"""
         from src.symbol.resolver import SymbolResolver
         from src.symbol.lldb_wrapper import LLDBWrapper
-        resolver = SymbolResolver(debugger=LLDBWrapper())
+        with patch('src.symbol.gdb_wrapper.shutil.which', return_value="/usr/bin/gdb"):
+            resolver = SymbolResolver(debugger=LLDBWrapper())
         assert isinstance(resolver.debugger, LLDBWrapper)
 
     def test_resolve_without_symbols(self, sample_crash_ctx):
         """验证无符号目录时仍能生成 ResolvedCrashContext（降级）"""
         from src.symbol.resolver import SymbolResolver
         from src.symbol.protocol import ResolvedResult
-        resolver = SymbolResolver()
+        with patch('src.symbol.gdb_wrapper.shutil.which', return_value="/usr/bin/gdb"):
+            resolver = SymbolResolver()
 
         mock_result = ResolvedResult(
             stack=[], registers={}, threads=[
@@ -58,7 +61,8 @@ class TestSymbolResolver:
         """验证 metadata/memory_maps/loaded_modules 透传"""
         from src.symbol.resolver import SymbolResolver
         from src.symbol.protocol import ResolvedResult
-        resolver = SymbolResolver()
+        with patch('src.symbol.gdb_wrapper.shutil.which', return_value="/usr/bin/gdb"):
+            resolver = SymbolResolver()
 
         mock_result = ResolvedResult(
             stack=[], registers={}, threads=[

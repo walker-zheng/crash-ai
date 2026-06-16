@@ -41,10 +41,22 @@ class SymbolResolver:
         symbol_paths = [str(symbol_dir)] if symbol_dir else []
 
         # 1. Get raw GDB output
-        result = self.debugger.resolve_stack(
-            core_path=str(core_path),
-            symbol_paths=symbol_paths,
-        )
+        try:
+            result = self.debugger.resolve_stack(
+                core_path=str(core_path),
+                symbol_paths=symbol_paths,
+            )
+        except Exception:
+            # GDB unavailable — return minimal context
+            return ResolvedCrashContext(
+                original=crash_ctx,
+                resolved_stack=[],
+                crash_thread=ThreadState(tid=0, lwpid=0, is_crashed=True),
+                signal_analysis=self._analyze_signal(crash_ctx.signal),
+                memory_maps=crash_ctx.memory_maps,
+                loaded_modules=crash_ctx.loaded_modules,
+                metadata=crash_ctx.metadata,
+            )
 
         # 2. Parse resolved frames from raw output
         resolved_stack = self.parser.parse_frames(result.raw_output)
