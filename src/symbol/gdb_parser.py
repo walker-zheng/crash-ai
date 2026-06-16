@@ -3,22 +3,34 @@ import re
 from typing import Dict, List
 
 from src.models.crash import MemRegion, Module
-from src.models.symbol import RawFrame, ThreadState
+from src.models.symbol import RawFrame, ResolvedFrame, ThreadState
 
 
 # GDB output format examples:
-#   Thread 1 (LWP 1234)  (crash thread *)
-#   #0  0x00007f1234567890 in foo (arg=0x0) at src/main.c:42
+#
+# info threads 输出:
+#   * 1    LWP 23            process (...) at main.c:12        (单线程)
+#   * 1    Thread 0x7fff... (LWP 1234) foo (...) at main.c:42  (多线程)
+#
+# thread apply all bt 输出:
+#   Thread 1 (LWP 23):
+#   #0  process (buf=0x...) at main.c:12       (innermost: 无地址)
+#   #1  0x0000555555555187 in main () at main.c:18  (含地址)
+#   #2  0x00007f1234567890 in ?? ()             (未符号化)
 
 THREAD_RE = re.compile(
-    r"^\s*\*?\s*(\d+)\s+\S+.*\(LWP\s+(\d+)\)"
+    r"^\s*\*?\s*(\d+)\s+.*?LWP\s+(\d+)"  # "  * 1    LWP 23" / "  * 1    Thread ... (LWP 1234)"
 )
 FRAME_RE = re.compile(
-    r"^#(\d+)\s+(0x[0-9a-fA-F]+)\s+in\s+(\S+)\s*\(.*\)"
-    r"(?:\s+at\s+(.+):(\d+))?"
+    r"^#(\d+)\s+"
+    r"(?:(0x[0-9a-fA-F]+)\s+in\s+)?"
+    r"(\S+)\s*\(.*?\)"
+    r"(?:\s+at\s+(.+?):(\d+))?"
 )
 FRAME_NO_SOURCE_RE = re.compile(
-    r"^#(\d+)\s+(0x[0-9a-fA-F]+)\s+in\s+(\S+)"
+    r"^#(\d+)\s+"
+    r"(?:(0x[0-9a-fA-F]+)\s+in\s+)?"
+    r"(\S+)"
 )
 REGISTER_RE = re.compile(
     r"^(\w+)\s+(0x[0-9a-fA-F]+)\s+\d+"
@@ -47,31 +59,54 @@ class GDBOutputParser:
                 ))
         return threads
 
-    def parse_frames(self, raw: str) -> List[RawFrame]:
-        """解析 thread apply all bt full 输出, 提取所有帧"""
-        frames = []
+    def parse_frames(self, raw: str) -> List[ResolvedFrame]:
+        """解析 thread apply all bt full 输出, 提取所有帧 (含源文件信息)。
+
+        支持两种格式:
+          (1) #N  0xADDR in FUNC (...) [at FILE:LINE]
+          (2) #N  FUNC (...) at FILE:LINE            (innermost, GDB 省略地址)
+
+        注意: GDB 在 info threads 和 backtrace 中可能重复输出相同帧,
+        去重逻辑按 (frame_num, function, source_file, source_line) 去重。
+        """
+        frames: list[ResolvedFrame] = []
+        seen: set[tuple[int, str, str, int]] = set()
         for line in raw.split("\n"):
             m = FRAME_RE.search(line)
             if m:
-                frames.append(RawFrame(
-                    frame_num=int(m.group(1)),
-                    address=m.group(2),
-                    function=m.group(3),
-                    offset="",  # GDB doesn't always show offset separately
-                    module=self._extract_module(
-                        m.group(4) if m.lastindex and m.lastindex >= 4 else ""
-                    ),
-                ))
+                addr = m.group(2) or ""
+                file_path = m.group(4) or ""
+                line_num = int(m.group(5)) if m.group(5) else 0
+                frame_num = int(m.group(1))
+                func = m.group(3)
+                key = (frame_num, func, file_path, line_num)
+                if key not in seen:
+                    seen.add(key)
+                    frames.append(ResolvedFrame(
+                        frame_num=frame_num,
+                        address=addr,
+                        function=func,
+                        offset="",
+                        module=self._extract_module(file_path),
+                        source_file=file_path,
+                        source_line=line_num,
+                    ))
                 continue
             m = FRAME_NO_SOURCE_RE.search(line)
             if m:
-                frames.append(RawFrame(
-                    frame_num=int(m.group(1)),
-                    address=m.group(2),
-                    function=m.group(3),
-                    offset="",
-                    module="??",
-                ))
+                addr = m.group(2) or ""
+                frame_num = int(m.group(1))
+                func = m.group(3)
+                key = (frame_num, func, "", 0)
+                if key not in seen:
+                    seen.add(key)
+                    frames.append(ResolvedFrame(
+                        frame_num=frame_num,
+                        address=addr,
+                        function=func,
+                        offset="",
+                        module="??",
+                    ))
         return frames
 
     def parse_registers(self, raw: str) -> Dict[str, str]:
