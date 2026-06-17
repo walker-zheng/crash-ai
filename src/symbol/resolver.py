@@ -193,5 +193,6 @@ class SymbolResolver:
             "SIGBUS": "SIGBUS: Bus error — likely unaligned memory access or mmap failure",
             "SIGFPE": "SIGFPE: Floating-point exception — division by zero or integer overflow",
             "SIGILL": "SIGILL: Illegal instruction — corrupted code or incompatible binary",
+            "SIGTRAP": "SIGTRAP: Breakpoint trap — macOS LLDB stack-smash or double-free detection (EXC_BREAKPOINT)",
         }
         return signal_map.get(signal, f"{signal}: Unknown signal")

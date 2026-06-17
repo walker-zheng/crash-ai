@@ -120,6 +120,7 @@ class CorrelationEngine:
         signal_patterns = {
             "SIGSEGV": ["null", "deref", "memcpy", "memset", "strcpy", "strcat", "memmove"],
             "SIGABRT": ["abort", "assert", "__assert_fail"],
+            "SIGTRAP": ["__stack_chk_fail", "free", "delete", "abort"],
             "SIGFPE": ["div", "mod", "fpu"],
             "SIGBUS": ["mmap", "align"],
         }
@@ -139,31 +140,49 @@ class CorrelationEngine:
         """检测常见危险模式"""
         patterns: List[str] = []
 
-        # NULL deref
-        if ctx.fault_addr == "0x0" or ctx.fault_addr == "0x0000000000000000":
-            patterns.append("NULL pointer dereference")
-        if "0x0" in ctx.registers.values():
-            patterns.append("NULL register value detected")
+        # 确定 top-frame function (小写)
+        top_func = (ctx.raw_stack[0].function.lower()
+                    if ctx.raw_stack and ctx.raw_stack[0] and ctx.raw_stack[0].function
+                    else "")
 
-        # Rip = 0x0
+        # 判断是否明显非 NULL-deref 崩溃类型:
+        #   SIGABRT -> assert/double-free (Linux)
+        #   SIGTRAP -> stack-smash/double-free (macOS LLDB)
+        #   SIGFPE  -> div-by-zero
+        #   SIGBUS  -> 对齐错误
+        #   以及栈顶函数 __stack_chk_fail / abort / __assert_fail
+        non_null_signals = {"SIGABRT", "SIGTRAP", "SIGFPE", "SIGBUS"}
+        non_null_funcs = ["__stack_chk_fail", "__assert_fail", "abort"]
+        is_non_null_context = (
+            ctx.signal in non_null_signals
+            or any(fn in top_func for fn in non_null_funcs)
+        )
+
+        # NULL deref patterns — 仅在确定非 NULL-deref 上下文时抑制
+        if not is_non_null_context:
+            if ctx.fault_addr == "0x0" or ctx.fault_addr == "0x0000000000000000":
+                patterns.append("NULL pointer dereference")
+            if "0x0" in ctx.registers.values():
+                patterns.append("NULL register value detected")
+
+            if ctx.signal == "SIGSEGV" and ctx.fault_addr == "0x0":
+                patterns.append("SIGSEGV with fault_addr=0x0: classic NULL dereference")
+
+        # Rip = 0x0 — 始终标记, 但区分上下文
         if ctx.registers.get("rip", "") in ("0x0", "0x0000000000000000"):
-            patterns.append("instruction pointer is NULL (rip=0x0)")
+            if is_non_null_context:
+                patterns.append("rip=0x0 (likely stack corruption, not null deref)")
+            else:
+                patterns.append("instruction pointer is NULL (rip=0x0)")
 
-        # Stack top check
-        if ctx.raw_stack:
-            top = ctx.raw_stack[0].function
-            if top:
-                top_lower = top.lower()
-                if "free" in top_lower:
-                    patterns.append("potential double-free (free() in crash frame)")
-                elif "memcpy" in top_lower or "sprintf" in top_lower or "strcpy" in top_lower:
-                    patterns.append("potential buffer overflow (string/memory copy in crash frame)")
-                elif "malloc" in top_lower or "new" in top_lower:
-                    patterns.append("potential use-after-free or allocation failure")
-
-        # SIGSEGV specific
-        if ctx.signal == "SIGSEGV" and ctx.fault_addr == "0x0":
-            patterns.append("SIGSEGV with fault_addr=0x0: classic NULL dereference")
+        # Stack top check — 始终执行 (不依赖 is_non_null_context)
+        if top_func:
+            if "free" in top_func:
+                patterns.append("potential double-free (free() in crash frame)")
+            elif "memcpy" in top_func or "sprintf" in top_func or "strcpy" in top_func:
+                patterns.append("potential buffer overflow (string/memory copy in crash frame)")
+            elif "malloc" in top_func or "new" in top_func:
+                patterns.append("potential use-after-free or allocation failure")
 
         return patterns
 
@@ -173,19 +192,21 @@ class CorrelationEngine:
         Uses signal, fault address, register state, and stack top function
         to determine the category without relying on LLM or keyword matching.
         Replaces the old hardcoded keyword-mapping approach in _normalize_response().
+
+        Priority order: signal-specific heuristics BEFORE generic fault_addr/register checks.
+        This prevents stack-smash/double-free/SIGBUS/SIGFPE from being misclassified
+        as null-deref when rip=0x0 or fault_addr=0x0 appears in GDB output.
         """
         fault_addr = ctx.fault_addr or ""
         signal = ctx.signal or ""
         reg_values = list(ctx.registers.values()) if ctx.registers else []
 
-        # NULL pointer dereference — fault at address 0
-        if fault_addr in ("0x0", "0x0000000000000000"):
-            return "null-deref"
-
-        # Look at top stack frame function
+        # Look at top stack frame function — needed for signal checks below
         top_func = ""
         if ctx.raw_stack and ctx.raw_stack[0] and ctx.raw_stack[0].function:
             top_func = ctx.raw_stack[0].function.lower()
+
+        # ── Signal-specific checks (优先于 generic fault_addr == 0x0) ──────────
 
         # SIGBUS — unaligned access / bad address
         if signal == "SIGBUS":
@@ -201,7 +222,16 @@ class CorrelationEngine:
                 return "double-free"
             return "assert-fail"
 
-        # Check top frame function for known crash operation patterns
+        # SIGTRAP -- macOS LLDB 对 stack-smash 和 double-free 输出此信号
+        # (EXC_BREAKPOINT), 而非 Linux 上的 SIGABRT
+        if signal == "SIGTRAP":
+            if top_func and "__stack_chk_fail" in top_func:
+                return "buffer-overflow"
+            if top_func and ("free" in top_func or "delete" in top_func):
+                return "double-free"
+            # SIGTRAP without known hazard: fall through to function/register checks below
+
+        # ── Top function heuristics ──────────────────────────────────────────
         if top_func:
             if any(fn in top_func for fn in
                    ["memcpy", "memmove", "strcpy", "strcat", "sprintf", "snprintf", "bcopy"]):
@@ -211,13 +241,20 @@ class CorrelationEngine:
             if any(fn in top_func for fn in ["malloc", "calloc", "new"]):
                 return "use-after-free"
 
+        # ── Generic null-deref detection (lower priority, after signal checks) ──
+
         # SIGSEGV — further analyze register values for indirect NULL deref
         if signal == "SIGSEGV":
+            if fault_addr in ("0x0", "0x0000000000000000"):
+                return "null-deref"
             if any(v in ("0x0", "0x0000000000000000") for v in reg_values):
                 return "null-deref"
             return "null-deref"  # common default for SIGSEGV
 
-        # Check if any register is NULL as a general safety net
+        # Non-SIGSEGV: fault_addr=0x0 or NULL register
+        if fault_addr in ("0x0", "0x0000000000000000"):
+            return "null-deref"
+
         if any(v in ("0x0", "0x0000000000000000") for v in reg_values):
             return "null-deref"
 

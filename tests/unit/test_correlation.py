@@ -217,9 +217,112 @@ class TestCorrelationEngine:
         ctx = self._make_context("SIGSEGV", "0x7fff", top_func="malloc")
         assert engine._infer_category(ctx) == "use-after-free"
 
+    def test_infer_category_sigtrap_stack_smash(self):
+        """SIGTRAP + __stack_chk_fail → buffer-overflow (macOS LLDB stack-smash)"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGTRAP", "0x7fff", top_func="__stack_chk_fail")
+        assert engine._infer_category(ctx) == "buffer-overflow"
+
+    def test_infer_category_sigtrap_double_free(self):
+        """SIGTRAP + free() in top frame → double-free (macOS LLDB)"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGTRAP", "0x7fff", top_func="free")
+        assert engine._infer_category(ctx) == "double-free"
+
     def test_infer_category_unknown(self):
         """无匹配模式 → unknown"""
         from src.analysis.correlation import CorrelationEngine
         engine = CorrelationEngine()
         ctx = self._make_context("SIGTRAP", "0x7fff", top_func="foo")
         assert engine._infer_category(ctx) == "unknown"
+
+    # ------------------------------------------------------------------
+    # 回归测试: 非 NULL-deref 用例应不受 fault_addr=0x0 / rip=0x0 影响
+    # ------------------------------------------------------------------
+
+    def test_infer_sigtrap_stack_smash_with_rip_zero(self):
+        """SIGTRAP + __stack_chk_fail 即使 rip=0x0 也应归类为 buffer-overflow"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context(
+            "SIGTRAP", "0x7fff", top_func="__stack_chk_fail",
+            registers={"rip": "0x0", "rsp": "0x7fff"},
+        )
+        assert engine._infer_category(ctx) == "buffer-overflow"
+
+    def test_infer_sigtrap_double_free_with_rip_zero(self):
+        """SIGTRAP + free() 即使 rip=0x0 也应归类为 double-free"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context(
+            "SIGTRAP", "0x7fff", top_func="free",
+            registers={"rip": "0x0", "rax": "0x1234"},
+        )
+        assert engine._infer_category(ctx) == "double-free"
+
+    def test_infer_sigabrt_double_free_with_fault_addr_zero(self):
+        """SIGABRT + free() + fault_addr=0x0 → double-free, 非 null-deref"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGABRT", "0x0", top_func="free")
+        assert engine._infer_category(ctx) == "double-free"
+
+    def test_infer_sigabrt_assert_fail_with_fault_addr_zero(self):
+        """SIGABRT + __assert_fail + fault_addr=0x0 → assert-fail, 非 null-deref"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGABRT", "0x0", top_func="__assert_fail")
+        assert engine._infer_category(ctx) == "assert-fail"
+
+    # ------------------------------------------------------------------
+    # 回归测试: _detect_danger_patterns 误报抑制
+    # ------------------------------------------------------------------
+
+    def test_danger_no_false_null_deref_on_sigtrap_stack_smash(self):
+        """SIGTRAP + __stack_chk_fail + rip=0x0 不应报告 NULL-deref"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context(
+            "SIGTRAP", "0x7fff", top_func="__stack_chk_fail",
+            registers={"rip": "0x0", "rsp": "0x7fff"},
+        )
+        patterns = engine._detect_danger_patterns(ctx)
+        # Should NOT contain NULL-deref patterns
+        assert not any("NULL" in p for p in patterns), f"Got unexpected NULL patterns: {patterns}"
+        # Should contain contextual rip message
+        assert any("stack corruption" in p for p in patterns), f"Missing contextual rip message: {patterns}"
+
+    def test_danger_no_false_null_deref_on_sigtrap_double_free(self):
+        """SIGTRAP + free() + rip=0x0 不应报告 NULL-deref"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context(
+            "SIGTRAP", "0x7fff", top_func="free",
+            registers={"rip": "0x0", "rax": "0x1234"},
+        )
+        patterns = engine._detect_danger_patterns(ctx)
+        assert not any("NULL" in p for p in patterns), f"Got unexpected NULL patterns: {patterns}"
+
+    def test_danger_no_false_null_deref_on_sigabrt_double_free(self):
+        """SIGABRT + free() + fault_addr=0x0 不应报告 NULL-deref"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context(
+            "SIGABRT", "0x0", top_func="free",
+            registers={"rax": "0x0", "rbx": "0x7fff"},
+        )
+        patterns = engine._detect_danger_patterns(ctx)
+        assert not any("NULL" in p for p in patterns), f"Got unexpected NULL patterns: {patterns}"
+
+    def test_danger_null_deref_still_detected_on_sigsegv(self):
+        """SIGSEGV + fault_addr=0x0 仍然应该报告 NULL-deref (回归不退化)"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context(
+            "SIGSEGV", "0x0", top_func="foo",
+            registers={"rip": "0x401234", "rax": "0x0"},
+        )
+        patterns = engine._detect_danger_patterns(ctx)
+        assert any("NULL" in p for p in patterns), f"Missing NULL patterns: {patterns}"
