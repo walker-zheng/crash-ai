@@ -132,3 +132,94 @@ class TestCorrelationEngine:
         result = engine.validate(ctx)
         # Should not crash; danger_patterns should be an empty list
         assert isinstance(result.danger_patterns, list)
+
+    # ------------------------------------------------------------------
+    # _infer_category 测试
+    # ------------------------------------------------------------------
+
+    def _make_context(self, signal: str, fault_addr: str, registers: dict | None = None,
+                      top_func: str | None = None) -> CrashContext:
+        """Helper: 快速构造 CrashContext"""
+        meta = CrashMetadata(
+            timestamp=datetime.now(), hostname="t", kernel_version="6.0",
+            distribution="u", arch="x86_64", coredump_size_bytes=1,
+        )
+        stack = []
+        if top_func is not None:
+            stack.append(RawFrame(0, "0x401000", top_func, "+0x0", "app"))
+        return CrashContext(
+            signal=signal, fault_addr=fault_addr,
+            thread_states=[], registers=registers or {},
+            raw_stack=stack, memory_maps=[], loaded_modules=[],
+            metadata=meta,
+        )
+
+    def test_infer_category_null_deref_by_addr(self):
+        """fault_addr=0x0 → null-deref"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGSEGV", "0x0")
+        assert engine._infer_category(ctx) == "null-deref"
+
+    def test_infer_category_null_deref_by_register(self):
+        """SIGSEGV + 寄存器含 0x0 → null-deref"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGSEGV", "0x7fff", registers={"rax": "0x0"})
+        assert engine._infer_category(ctx) == "null-deref"
+
+    def test_infer_category_sigbus(self):
+        """SIGBUS → sigbus-unaligned"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGBUS", "0x7fff")
+        assert engine._infer_category(ctx) == "sigbus-unaligned"
+
+    def test_infer_category_sigfpe(self):
+        """SIGFPE → division-by-zero"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGFPE", "0x7fff")
+        assert engine._infer_category(ctx) == "division-by-zero"
+
+    def test_infer_category_double_free(self):
+        """SIGABRT + free() in top frame → double-free"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGABRT", "0x7fff", top_func="free")
+        assert engine._infer_category(ctx) == "double-free"
+
+    def test_infer_category_assert_fail(self):
+        """SIGABRT without free → assert-fail"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGABRT", "0x7fff", top_func="__assert_fail")
+        assert engine._infer_category(ctx) == "assert-fail"
+
+    def test_infer_category_buffer_overflow(self):
+        """memcpy in top frame → buffer-overflow"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGSEGV", "0x7fff", top_func="memcpy")
+        assert engine._infer_category(ctx) == "buffer-overflow"
+
+    def test_infer_category_use_after_free(self):
+        """free() in top frame (SIGSEGV) → use-after-free"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGSEGV", "0x7fff", top_func="free")
+        assert engine._infer_category(ctx) == "use-after-free"
+
+    def test_infer_category_use_after_free_malloc(self):
+        """malloc in top frame (SIGSEGV) → use-after-free"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGSEGV", "0x7fff", top_func="malloc")
+        assert engine._infer_category(ctx) == "use-after-free"
+
+    def test_infer_category_unknown(self):
+        """无匹配模式 → unknown"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        ctx = self._make_context("SIGTRAP", "0x7fff", top_func="foo")
+        assert engine._infer_category(ctx) == "unknown"

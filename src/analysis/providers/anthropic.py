@@ -95,7 +95,8 @@ class AnthropicProvider(LLMProvider):
             rc["description"] = sig
 
         # Extract category — 三层优先级:
-        #   1. LLM 显式 category (最可信, 直接信任)
+        #   1. LLM 显式 category (经 _match_category_keyword 归一化到规范形式,
+        #      确保下游输出一致; 不匹配时保留原始值)
         #   2. CorrelationEngine 确定性推断 (多源交叉验证)
         #   3. LLM 描述文本关键词匹配 (后备)
         explicit_cat = None
@@ -104,7 +105,9 @@ class AnthropicProvider(LLMProvider):
             explicit_cat = raw if raw else None
 
         if explicit_cat:
-            rc["category"] = explicit_cat
+            # 归一化确保输出一致性: "Null pointer dereference" → "null-deref"
+            norm_cat = AnthropicProvider._match_category_keyword(explicit_cat.lower())
+            rc["category"] = norm_cat or explicit_cat
         elif suggested_category:
             # 使用 CorrelationEngine 的多源交叉验证结果 (确定性分析)
             rc["category"] = suggested_category

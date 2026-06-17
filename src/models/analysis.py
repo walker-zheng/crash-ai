@@ -8,7 +8,7 @@ from typing import List, Optional
 class RootCause:
     """根因分析"""
 
-    category: str  # null-pointer / use-after-free / double-free / buffer-overflow / stack-overflow / race-condition / unknown
+    category: str  # null-deref / use-after-free / double-free / buffer-overflow / race-condition / deadlock / sigbus-unaligned / division-by-zero / assert-fail / unknown
     description: str
     crash_location: str  # file:line
     trigger_condition: str
