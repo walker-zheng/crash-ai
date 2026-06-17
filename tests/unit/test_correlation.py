@@ -108,3 +108,27 @@ class TestCorrelationEngine:
         assert "value" in result.register_var_map["rax"]
         assert "is_null" in result.register_var_map["rax"]
         assert result.register_var_map["rax"]["is_null"] is True
+
+    def test_danger_patterns_function_none(self):
+        """raw_stack[0].function=None 不应抛 AttributeError"""
+        from src.analysis.correlation import CorrelationEngine
+        engine = CorrelationEngine()
+        meta = CrashMetadata(
+            timestamp=datetime.now(), hostname="", kernel_version="",
+            distribution="", arch="x86_64", coredump_size_bytes=0,
+        )
+        ctx = CrashContext(
+            signal="SIGSEGV",
+            fault_addr="0x7fff",
+            thread_states=[],
+            registers={"rax": "0x7fff"},
+            raw_stack=[
+                RawFrame(0, "0x7fff", None, "+0x0", "app"),
+            ],
+            memory_maps=[],
+            loaded_modules=[],
+            metadata=meta,
+        )
+        result = engine.validate(ctx)
+        # Should not crash; danger_patterns should be an empty list
+        assert isinstance(result.danger_patterns, list)
