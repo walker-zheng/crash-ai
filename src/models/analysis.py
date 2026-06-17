@@ -56,3 +56,4 @@ class CorrelatedContext:
     lock_analysis: Optional[str] = None
     memory_analysis: Optional[str] = None
     danger_patterns: List[str] = field(default_factory=list)
+    suggested_category: str = ""  # CorrelationEngine 确定性推断的崩溃类别

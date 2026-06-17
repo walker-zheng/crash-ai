@@ -41,6 +41,20 @@ class LLMRouter:
             return provider_cls(api_key=self.config.deepseek_api_key)
         raise ValueError(f"Unknown provider: {name}")
 
-    async def analyze(self, system: str, user: str) -> dict:
-        """通过当前 provider 执行 LLM 分析。"""
-        return await self.provider.chat_json(system, user)
+    async def analyze(self, system: str, user: str, danger_patterns: list[str] | None = None,
+                       suggested_category: str = "") -> dict:
+        """通过当前 provider 执行 LLM 分析。
+
+        Args:
+            system: System prompt.
+            user: User prompt.
+            danger_patterns: Optional CorrelationEngine danger patterns to assist
+                category inference during response normalization.
+            suggested_category: Optional CorrelationEngine inferred category
+                to use when LLM output is ambiguous.
+        """
+        return await self.provider.chat_json(
+            system, user,
+            danger_patterns=danger_patterns,
+            suggested_category=suggested_category,
+        )

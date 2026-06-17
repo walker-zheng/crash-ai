@@ -82,7 +82,7 @@ class TestAnthropicProvider:
         mock_response.content = [MagicMock()]
         mock_response.content[0].text = '{"result": "success"}'
 
-        with patch.object(provider.client.messages, 'create', return_value=mock_response):
+        with patch.object(provider.client.messages, 'create', new_callable=AsyncMock, return_value=mock_response):
             result = await provider.chat_json("system", "user")
             assert result == {"result": "success"}
 

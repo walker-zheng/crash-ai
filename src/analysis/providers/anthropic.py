@@ -14,16 +14,27 @@ class AnthropicProvider(LLMProvider):
     """
 
     def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.client = anthropic.AsyncAnthropic(api_key=api_key)
         self.model = model
 
     async def chat_json(self, system: str, user: str, **kwargs) -> dict:
-        """向 Claude/DeepSeek (Anthropic 兼容) 发送请求并解析 JSON 响应。"""
+        """向 Claude/DeepSeek (Anthropic 兼容) 发送请求并解析 JSON 响应。
+
+        Args:
+            system: System prompt.
+            user: User prompt.
+            **kwargs: Extra keyword arguments. Supports 'danger_patterns' (list[str])
+                passed from the AnalysisEngine for category inference during normalization.
+        """
+        # Extract danger_patterns and suggested_category before forwarding remaining kwargs
+        danger_patterns = kwargs.pop("danger_patterns", None)
+        suggested_category = kwargs.pop("suggested_category", "")
+
         enhanced_user = (
             f"{user}\n\n"
             "Return ONLY valid JSON, no markdown fences, no extra text."
         )
-        response = self.client.messages.create(
+        response = await self.client.messages.create(
             model=self.model,
             max_tokens=4096,
             system=system,
@@ -37,12 +48,15 @@ class AnthropicProvider(LLMProvider):
         # Normalize DeepSeek's flat CoT output into expected nested structure
         cot_keys = {"signal_analysis", "root_cause_inference", "evidence_extraction"}
         if "root_cause" not in result and cot_keys & set(result.keys()):
-            result = self._normalize_response(result)
+            result = self._normalize_response(result, danger_patterns=danger_patterns,
+                                               suggested_category=suggested_category)
 
         return result
 
+
     @staticmethod
-    def _normalize_response(data: dict) -> dict:
+    def _normalize_response(data: dict, danger_patterns: list[str] | None = None,
+                            suggested_category: str = "") -> dict:
         """Normalize non-standard JSON responses into expected AnalysisReport format.
 
         DeepSeek with CoT prompts may output flat keys like:
@@ -50,6 +64,18 @@ class AnthropicProvider(LLMProvider):
         instead of the expected nested structure:
         root_cause: {category, description, crash_location, trigger_condition}
         evidence: [{type, description, relevance}]
+
+        Category inference priority (3 levels):
+          1. LLM explicit category (most trustworthy — used as-is)
+          2. CorrelationEngine deterministic category (from _infer_category ctx analysis)
+          3. LLM description keyword matching (fallback)
+
+        Args:
+            data: Raw LLM response dict.
+            danger_patterns: Optional CorrelationEngine danger patterns (kept for
+                compatibility, no longer used for category inference).
+            suggested_category: CorrelationEngine's deterministic category guess
+                from _infer_category(), based on signal/fault_addr/registers/stack.
         """
         normalized = {}
 
@@ -68,52 +94,24 @@ class AnthropicProvider(LLMProvider):
         elif isinstance(sig, str):
             rc["description"] = sig
 
-        # Extract category (prefer explicit category from LLM)
+        # Extract category — 三层优先级:
+        #   1. LLM 显式 category (最可信, 直接信任)
+        #   2. CorrelationEngine 确定性推断 (多源交叉验证)
+        #   3. LLM 描述文本关键词匹配 (后备)
+        explicit_cat = None
         if isinstance(rci, dict) and "category" in rci:
-            raw_cat = rci["category"].lower()
-            if "null" in raw_cat:
-                rc["category"] = "null-deref"
-            elif "double free" in raw_cat:
-                rc["category"] = "double-free"
-            elif "buffer" in raw_cat or "overflow" in raw_cat:
-                rc["category"] = "buffer-overflow"
-            elif "use after free" in raw_cat or "uaf" in raw_cat:
-                rc["category"] = "use-after-free"
-            elif "race" in raw_cat:
-                rc["category"] = "race-condition"
-            elif "deadlock" in raw_cat:
-                rc["category"] = "deadlock"
-            elif "unaligned" in raw_cat:
-                rc["category"] = "sigbus-unaligned"
-            elif "divide" in raw_cat or "division" in raw_cat:
-                rc["category"] = "division-by-zero"
-            elif "assert" in raw_cat:
-                rc["category"] = "assert-fail"
-            else:
-                rc["category"] = raw_cat.replace(" ", "-")[:40]
+            raw = rci["category"].strip()
+            explicit_cat = raw if raw else None
+
+        if explicit_cat:
+            rc["category"] = explicit_cat
+        elif suggested_category:
+            # 使用 CorrelationEngine 的多源交叉验证结果 (确定性分析)
+            rc["category"] = suggested_category
         else:
-            # Infer from description text
+            # 后备: 从 LLM 描述文本关键词匹配
             desc_lower = rc.get("description", "").lower()
-            if "null" in desc_lower:
-                rc["category"] = "null-deref"
-            elif "double free" in desc_lower:
-                rc["category"] = "double-free"
-            elif "buffer overflow" in desc_lower or "stack overflow" in desc_lower:
-                rc["category"] = "buffer-overflow"
-            elif "use after free" in desc_lower or "uaf" in desc_lower:
-                rc["category"] = "use-after-free"
-            elif "race" in desc_lower:
-                rc["category"] = "race-condition"
-            elif "deadlock" in desc_lower:
-                rc["category"] = "deadlock"
-            elif "unaligned" in desc_lower:
-                rc["category"] = "sigbus-unaligned"
-            elif "divide" in desc_lower:
-                rc["category"] = "division-by-zero"
-            elif "assert" in desc_lower:
-                rc["category"] = "assert-fail"
-            else:
-                rc["category"] = "unknown"
+            rc["category"] = AnthropicProvider._match_category_keyword(desc_lower) or "unknown"
 
         rc["crash_location"] = _extract_crash_location(data)
         rc["trigger_condition"] = _extract_trigger_condition(data)
@@ -145,6 +143,40 @@ class AnthropicProvider(LLMProvider):
         normalized["confidence"] = float(data.get("confidence", 0.5))
 
         return normalized
+
+    @staticmethod
+    def _match_category_keyword(text: str) -> str | None:
+        """Map a text string to a crash category using keyword matching.
+
+        This is the single source of truth for keyword → category mapping,
+        used both for LLM's explicit category field and for description-based fallback.
+        """
+        if not text:
+            return None
+        # Order matters: more specific patterns must come first
+        if "null" in text:
+            return "null-deref"
+        if "double free" in text:
+            return "double-free"
+        if "use after free" in text or " uaf " in text or text.startswith("uaf"):
+            return "use-after-free"
+        if "buffer overflow" in text or "stack overflow" in text:
+            return "buffer-overflow"
+        if "buffer" in text or "overflow" in text:
+            return "buffer-overflow"
+        if "race" in text:
+            return "race-condition"
+        if "deadlock" in text:
+            return "deadlock"
+        if "unaligned" in text:
+            return "sigbus-unaligned"
+        if "divide" in text or "division" in text:
+            return "division-by-zero"
+        if "assert" in text:
+            return "assert-fail"
+        # Return text with spaces replaced as fallback
+        cleaned = text.replace(" ", "-")[:40]
+        return cleaned if cleaned else None
 
     @staticmethod
     def _extract_text(content) -> str:

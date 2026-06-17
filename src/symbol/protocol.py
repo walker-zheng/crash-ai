@@ -21,9 +21,16 @@ class DebuggerProtocol(ABC):
 
     @abstractmethod
     def resolve_stack(
-        self, core_path: str, symbol_paths: list[str]
+        self, core_path: str, symbol_paths: list[str],
+        exe_path: str | None = None,
     ) -> ResolvedResult:
-        """解析崩溃堆栈, 返回符号化结果。"""
+        """解析崩溃堆栈, 返回符号化结果。
+
+        Args:
+            core_path: core dump 文件路径
+            symbol_paths: 调试符号目录列表
+            exe_path: 可执行文件路径 (可选, 提供后可解析函数名)
+        """
         ...
 
     @abstractmethod

@@ -41,6 +41,9 @@ class CorrelationEngine:
         # 5. Build register → var map (heuristic)
         register_var_map = self._build_register_var_map(ctx.registers)
 
+        # 6. Infer crash category from deterministic context analysis
+        suggested_category = self._infer_category(ctx)
+
         return CorrelatedContext(
             timeline_alignment=[
                 {"source_a": v.source_a, "source_b": v.source_b,
@@ -50,6 +53,7 @@ class CorrelationEngine:
             register_var_map=register_var_map,
             memory_analysis=self._memory_analysis(ctx.fault_addr, ctx.memory_maps),
             danger_patterns=danger_patterns,
+            suggested_category=suggested_category,
         )
 
     def _check_register_stack_consistency(
@@ -162,6 +166,62 @@ class CorrelationEngine:
             patterns.append("SIGSEGV with fault_addr=0x0: classic NULL dereference")
 
         return patterns
+
+    def _infer_category(self, ctx: CrashContext) -> str:
+        """Infer the most likely crash category from deterministic context analysis.
+
+        Uses signal, fault address, register state, and stack top function
+        to determine the category without relying on LLM or keyword matching.
+        Replaces the old hardcoded keyword-mapping approach in _normalize_response().
+        """
+        fault_addr = ctx.fault_addr or ""
+        signal = ctx.signal or ""
+        reg_values = list(ctx.registers.values()) if ctx.registers else []
+
+        # NULL pointer dereference — fault at address 0
+        if fault_addr in ("0x0", "0x0000000000000000"):
+            return "null-deref"
+
+        # Look at top stack frame function
+        top_func = ""
+        if ctx.raw_stack and ctx.raw_stack[0] and ctx.raw_stack[0].function:
+            top_func = ctx.raw_stack[0].function.lower()
+
+        # SIGBUS — unaligned access / bad address
+        if signal == "SIGBUS":
+            return "sigbus-unaligned"
+
+        # SIGFPE — arithmetic error (division by zero, etc.)
+        if signal == "SIGFPE":
+            return "division-by-zero"
+
+        # SIGABRT — assertion failure or detected corruption (e.g. double-free)
+        if signal == "SIGABRT":
+            if top_func and ("free" in top_func or "delete" in top_func):
+                return "double-free"
+            return "assert-fail"
+
+        # Check top frame function for known crash operation patterns
+        if top_func:
+            if any(fn in top_func for fn in
+                   ["memcpy", "memmove", "strcpy", "strcat", "sprintf", "snprintf", "bcopy"]):
+                return "buffer-overflow"
+            if "free" in top_func or "realloc" in top_func:
+                return "use-after-free"
+            if any(fn in top_func for fn in ["malloc", "calloc", "new"]):
+                return "use-after-free"
+
+        # SIGSEGV — further analyze register values for indirect NULL deref
+        if signal == "SIGSEGV":
+            if any(v in ("0x0", "0x0000000000000000") for v in reg_values):
+                return "null-deref"
+            return "null-deref"  # common default for SIGSEGV
+
+        # Check if any register is NULL as a general safety net
+        if any(v in ("0x0", "0x0000000000000000") for v in reg_values):
+            return "null-deref"
+
+        return "unknown"
 
     def _build_register_var_map(self, registers: Dict[str, str]) -> dict:
         """构建寄存器 → 值映射摘要"""

@@ -85,6 +85,8 @@ class AnalysisEngine:
                 max_retries=3,
                 base_delay=1.0,
                 exceptions=(json.JSONDecodeError, AnalysisIncompleteError),
+                danger_patterns=correlated.danger_patterns,
+                suggested_category=correlated.suggested_category,
             )
         except Exception as exc:
             return self._build_fallback_report(ctx, crash_id, str(exc))

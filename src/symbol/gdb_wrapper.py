@@ -27,9 +27,16 @@ class GDBWrapper(DebuggerProtocol):
             )
 
     def resolve_stack(
-        self, core_path: str, symbol_paths: list[str]
+        self, core_path: str, symbol_paths: list[str],
+        exe_path: str | None = None,
     ) -> ResolvedResult:
-        """执行 GDB 批处理栈解析。"""
+        """执行 GDB 批处理栈解析。
+
+        必须提供 exe_path 才能正确解析函数名 (否则所有帧显示 ??)。
+
+        GDB 命令格式:
+            gdb -batch -nx -nh -q <exe_path> -c <core> -ex ...
+        """
         symbol_args = []
         for sp in symbol_paths:
             symbol_args.extend(["-ex", f"set debug-file-directory {sp}"])
@@ -37,11 +44,16 @@ class GDBWrapper(DebuggerProtocol):
         cmd = [
             self.gdb_path,
             "-batch", "-nx", "-nh", "-q",
+        ]
+        if exe_path:
+            cmd.append(exe_path)
+        cmd.extend([
             "-ex", "info threads",
+            "-ex", "set backtrace limit 200",
             "-ex", "thread apply all bt full",
             *symbol_args,
             "-c", core_path,
-        ]
+        ])
 
         result = subprocess.run(
             cmd,

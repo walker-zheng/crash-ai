@@ -6,11 +6,18 @@ from src.models.crash import MemRegion, Module
 from src.models.symbol import RawFrame, ResolvedFrame, ThreadState
 
 
-# GDB output format examples:
+# Output format examples:
 #
-# info threads 输出:
+# GDB info threads 输出 (Linux):
 #   * 1    LWP 23            process (...) at main.c:12        (单线程)
 #   * 1    Thread 0x7fff... (LWP 1234) foo (...) at main.c:42  (多线程)
+#
+# GDB info threads 输出 (macOS, 无 LWP 字段):
+#   * 1    Thread 0x7fff...  foo (...) at main.c:12
+#
+# LLDB thread list 输出 (macOS, 无 LWP 字段):
+#   * thread #1, name = 'a.out'
+#     thread #2, name = 'a.out'
 #
 # thread apply all bt 输出:
 #   Thread 1 (LWP 23):
@@ -19,7 +26,13 @@ from src.models.symbol import RawFrame, ResolvedFrame, ThreadState
 #   #2  0x00007f1234567890 in ?? ()             (未符号化)
 
 THREAD_RE = re.compile(
-    r"^\s*\*?\s*(\d+)\s+.*?LWP\s+(\d+)"  # "  * 1    LWP 23" / "  * 1    Thread ... (LWP 1234)"
+    r"^\s*\*?\s*(?:"
+    r"(\d+)\s+.*?LWP\s+(\d+)"      # GDB with LWP: "1    LWP 23" / "1    Thread ... (LWP 1234)"
+    r"|"
+    r"(\d+)\s+(?:Thread|process)"   # GDB without LWP (macOS): "1    Thread 0x7fff..."
+    r"|"
+    r"thread\s+#?(\d+)"             # LLDB: "thread #1" / "thread 1"
+    r")"
 )
 FRAME_RE = re.compile(
     r"^#(\d+)\s+"
@@ -35,10 +48,31 @@ FRAME_NO_SOURCE_RE = re.compile(
 REGISTER_RE = re.compile(
     r"^(\w+)\s+(0x[0-9a-fA-F]+)\s+\d+"
 )
+# 内存映射正则: 支持 GDB info proc mappings + LLDB memory region 双格式
+#
+# GDB info proc mappings (Linux/macOS):
+#   0xADDR 0xADDR perms offset [dev inode] path
+#
+# LLDB memory region (macOS):
+#   [0xADDR-0xADDR) perms [path]
+#
+# Group numbering:
+#   (1)/(2): GDB start/end addr    | (3)/(4): LLDB start/end addr
+#   (5) permissions  (6) offset    | (7) path (optional)
 MEMORY_MAP_RE = re.compile(
-    r"^\s*(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+"
-    r"([r\-][w\-][x\-][sp\-])\s+(0x[0-9a-fA-F]+)"
-    r"\s+\S+\s+\S+\s+(.+)"
+    r"^\s*"
+    r"(?:"
+    r"(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)"          # GDB: two 0x-addr
+    r"|"
+    r"\[(0x[0-9a-fA-F]+)-(0x[0-9a-fA-F]+)\)"          # LLDB: [range)
+    r")"
+    r"\s+"
+    # Permissions: case-insensitive, 3-4 chars (r-xp / rwx / ---p / R-X)
+    r"((?:[rR-][wW-][xX-](?:[pPsS-])?))"
+    # GDB offset + optional dev:inode columns
+    r"(?:\s+(0x[0-9a-fA-F]+)(?:\s+\S+\s+\S+)?)?"
+    # Optional path (anonymous mappings have no path)
+    r"(?:\s+(.*))?"
 )
 
 
@@ -46,15 +80,34 @@ class GDBOutputParser:
     """解析 GDB 批处理模式的文本输出。"""
 
     def parse_threads(self, raw: str) -> List[ThreadState]:
-        """解析 info threads 输出, 提取线程列表"""
+        """解析 info threads / thread list 输出, 提取线程列表。
+
+        支持三种格式:
+          (1) GDB with LWP:     * 1    LWP 1234
+                               * 1    Thread 0x7fff... (LWP 1234)
+          (2) GDB no LWP (macOS): * 1    Thread 0x7fff...
+          (3) LLDB:              * thread #1, ... /   thread #2, ...
+        """
         threads = []
         for line in raw.split("\n"):
             m = THREAD_RE.search(line)
             if m:
                 is_crashed = line.strip().startswith("*")
+                if m.group(1) is not None:
+                    # GDB format — has LWP
+                    tid = int(m.group(1))
+                    lwpid = int(m.group(2))
+                elif m.group(3) is not None:
+                    # GDB format — no LWP (macOS GDB omits LWP)
+                    tid = int(m.group(3))
+                    lwpid = tid
+                else:
+                    # LLDB format — no LWP, use tid as lwpid
+                    tid = int(m.group(4))
+                    lwpid = tid  # macOS has no LWP
                 threads.append(ThreadState(
-                    tid=int(m.group(1)),
-                    lwpid=int(m.group(2)),
+                    tid=tid,
+                    lwpid=lwpid,
                     is_crashed=is_crashed,
                 ))
         return threads
@@ -119,17 +172,22 @@ class GDBOutputParser:
         return regs
 
     def parse_memory_maps(self, raw: str) -> list[MemRegion]:
-        """解析 info proc mappings 输出"""
+        """解析内存映射输出 (GDB info proc mappings / LLDB memory region / image list)。"""
         maps = []
         for line in raw.split("\n"):
             m = MEMORY_MAP_RE.search(line)
             if m:
+                start_addr = m.group(1) or m.group(3)   # GDB or LLDB start
+                end_addr = m.group(2) or m.group(4)      # GDB or LLDB end
+                perms = m.group(5)
+                offset = m.group(6) or "0x0"             # LLDB 无 offset 列
+                mapped_file = (m.group(7) or "").strip()
                 maps.append(MemRegion(
-                    start_addr=m.group(1),
-                    end_addr=m.group(2),
-                    permissions=m.group(3),
-                    offset=m.group(4),
-                    mapped_file=m.group(5).strip(),
+                    start_addr=start_addr,
+                    end_addr=end_addr,
+                    permissions=perms,
+                    offset=offset,
+                    mapped_file=mapped_file,
                 ))
         return maps
 
